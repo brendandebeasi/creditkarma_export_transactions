@@ -3,16 +3,73 @@
 # This script will fetch all of your credit karma transactions and write them to a csv file.
 # Set MY_ACCESS_TOKEN to your credit karma access token, which you can get from the browser console on the creditkarma site calls to the graphql api in the authorization header
 # Set START_CURSOR to the last cursor you attempted to fetch from, if you want to restart where you left off.
+#   (or just re-run - it auto-saves cursor to .creditkarma_cursor and resumes automatically)
 # Set DEBUG=1 to see the json entries for each transaction
+# Set REQUEST_DELAY=2.0 to change delay between requests (default: 1.5 seconds)
+# Set MAX_RETRIES=3 to change max retry attempts on network errors (default: 5)
 
 require 'net/http'
 require 'json'
+require 'openssl'
 
 # only need this for debugging, and not in standard lib
 require 'awesome_print' if ENV['DEBUG']
 
+CURSOR_FILE = '.creditkarma_cursor'
+REQUEST_DELAY_SECONDS = Float(ENV['REQUEST_DELAY'] || 1.5)
+MAX_RETRIES = Integer(ENV['MAX_RETRIES'] || 5)
+INITIAL_BACKOFF_SECONDS = 5
+
 def debug(msg)
   ap msg if ENV['DEBUG']
+end
+
+def save_cursor(cursor)
+  File.write(CURSOR_FILE, cursor) if cursor
+end
+
+def load_saved_cursor
+  return nil unless File.exist?(CURSOR_FILE)
+  cursor = File.read(CURSOR_FILE).strip
+  cursor.empty? ? nil : cursor
+end
+
+def clear_cursor_file
+  File.delete(CURSOR_FILE) if File.exist?(CURSOR_FILE)
+end
+
+RETRIABLE_ERRORS = [
+  Errno::ETIMEDOUT,
+  Errno::ECONNREFUSED,
+  Errno::ECONNRESET,
+  Errno::EHOSTUNREACH,
+  Net::OpenTimeout,
+  Net::ReadTimeout,
+  SocketError,
+  OpenSSL::SSL::SSLError
+].freeze
+
+def with_retry(cursor, &block)
+  retries = 0
+  begin
+    block.call
+  rescue *RETRIABLE_ERRORS => e
+    retries += 1
+    if retries <= MAX_RETRIES
+      backoff = INITIAL_BACKOFF_SECONDS * (2 ** (retries - 1))
+      puts "Network error: #{e.class} - #{e.message}"
+      puts "Retry #{retries}/#{MAX_RETRIES} after #{backoff}s... (cursor saved to #{CURSOR_FILE})"
+      save_cursor(cursor)
+      sleep(backoff)
+      retry
+    else
+      save_cursor(cursor)
+      puts "\nFailed after #{MAX_RETRIES} retries. Cursor saved to #{CURSOR_FILE}"
+      puts "Resume later with: ruby fetch_credit_karma_transactions"
+      puts "Or manually: START_CURSOR=#{cursor} ruby fetch_credit_karma_transactions"
+      raise
+    end
+  end
 end
 
 @help_message = <<-HEREDOC
@@ -20,19 +77,28 @@ end
 
   export MY_ACCESS_TOKEN=your_new_access_token_here
 
-  If the token expires, you can restart where you left off by setting the START_CURSOR env var to the last attempted value: #{defined?(after_cursor) ? after_cursor : 'examplecursor'}
+  The script auto-saves progress to .creditkarma_cursor, so if it fails you can just re-run it with a fresh token and it will resume automatically.
 
-  Example where the first run works, but then you get TOKEN_NEEDS_REFRESH, and need to use the START_CURSOR to restart where you left off:
+  You can also manually set START_CURSOR env var to override the saved cursor.
+
+  Config options (all optional):
+    REQUEST_DELAY=1.5   - seconds between requests (default: 1.5)
+    MAX_RETRIES=5       - retry attempts on network errors (default: 5)
+    DEBUG=1             - show detailed transaction data
+
+  Example where the first run works, but then you get TOKEN_NEEDS_REFRESH:
 
   $ ruby fetch_credit_karma_transactions
   getting next page cursor: dHhuIzIwMjQtMDItMDUjMTg5MDUxMjUxOF8w
   total transactions: 100, last date: 2024-01-10
   ...
-  total transactions: 1900, last date: 2023-02-21
-  getting next page cursor: dHhuIzIwMjMtMDItMjEjMTgzODQ4MzIzMF8w
-  fetch_credit_karma_transactions.rb:3918:in `get_transactions': error: 401 body: {"errorCode":"TOKEN_NEEDS_REFRESH"} (RuntimeError)
+  error: 401 body: {"errorCode":"TOKEN_NEEDS_REFRESH"}
 
-  $ START_CURSOR=dHhuIzIwMjMtMDItMjEjMTgzODQ4MzIzMF8w fetch_credit_karma_transactions
+  # Just get a new token and re-run - it auto-resumes:
+  $ export MY_ACCESS_TOKEN=your_new_token
+  $ ruby fetch_credit_karma_transactions
+  Resuming from cursor: dHhuIzIwMjMtMDItMjEjMTgzODQ4MzIzMF8w
+  ...
 HEREDOC
 
 # not sure how to get rid of the SHIT Prime_ServerError stuff
@@ -3924,8 +3990,12 @@ end
 
 total_transactions = []
 has_next_page = true
-# fine if this is nil to start
-cursor = ENV['START_CURSOR']
+# Priority: ENV var > saved cursor file > nil (start from beginning)
+cursor = ENV['START_CURSOR'] || load_saved_cursor
+if cursor
+  puts "Resuming from cursor: #{cursor}"
+  puts "(from #{ENV['START_CURSOR'] ? 'START_CURSOR env var' : CURSOR_FILE})"
+end
 
 # This is useful for importing into anything that supports the mint CSV format, like monarchmoney.com
 out_file_csv = File.new("creditkarma_transactions.csv", "a")
@@ -3939,7 +4009,14 @@ end
 
 while has_next_page
   puts "getting next page cursor: #{cursor}" if cursor
-  resp = get_transactions(cursor)
+
+  # Save current cursor before attempting fetch (so we can resume if it fails)
+  save_cursor(cursor) if cursor
+
+  resp = with_retry(cursor) { get_transactions(cursor) }
+
+  # Rate limit: wait between requests
+  sleep(REQUEST_DELAY_SECONDS) if REQUEST_DELAY_SECONDS > 0
   resp_data = resp.dig('data', 'prime', 'transactionsHub', 'transactionPage', 'transactions')
   unless resp_data
     puts "expected data not in response: \n\n#{resp}"
@@ -3996,4 +4073,6 @@ end
 out_file_csv.close
 out_file_full_json.close
 
-puts "done"
+# Clear cursor file on successful completion
+clear_cursor_file
+puts "done - cursor file cleared"
