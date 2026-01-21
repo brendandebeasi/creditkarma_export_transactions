@@ -1,0 +1,385 @@
+#!/usr/bin/env ruby
+
+# Credit Karma GraphQL API Explorer
+#
+# This script helps discover available GraphQL operations by:
+# 1. Extracting operation names and types from captured JSON responses
+# 2. Attempting introspection queries (often disabled in production)
+# 3. Making arbitrary GraphQL queries for exploration
+#
+# Usage:
+#   # Analyze captured JSON files for operations
+#   ruby explore_graphql --analyze
+#
+#   # Try introspection (requires MY_ACCESS_TOKEN env var)
+#   ruby explore_graphql --introspect
+#
+#   # Make a custom query
+#   ruby explore_graphql --query "query { prime { ... } }"
+#
+#   # List known operations
+#   ruby explore_graphql --list
+
+require 'json'
+require 'net/http'
+require 'uri'
+require 'set'
+
+API_URL = 'https://api.creditkarma.com/graphql'
+
+# Known GraphQL operations discovered from analysis
+KNOWN_OPERATIONS = {
+  # Transaction operations
+  'GetTransactions' => {
+    description: 'Fetch transaction history with pagination',
+    path: 'prime.transactionsHub',
+    input: 'Prime_TransactionFiltersInput'
+  },
+
+  # Net worth / balance operations
+  'networth' => {
+    description: 'Overall net worth summary and history chart',
+    path: 'prime.networth',
+    notes: 'Contains dataVisualizationGroupDataSets with balance history'
+  },
+  'networthByAccountType' => {
+    description: 'Balance history for specific account categories (Cash, Investments, etc)',
+    path: 'prime.networthByAccountType',
+    notes: 'Accessed via L2 pages when clicking on account categories'
+  },
+
+  # Dashboard operations
+  'dashboardV2' => {
+    description: 'Main dashboard with credit scores',
+    path: 'dashboardV2.equifaxCredit, dashboardV2.transunionCredit',
+    notes: 'Contains credit scores for both bureaus'
+  },
+
+  # Profile operations
+  'profileOverview' => {
+    description: 'User profile information',
+    path: 'profileOverview.getProfileOverview',
+    notes: 'Name, address, etc.'
+  },
+
+  # Loans operations
+  'MyLoansQuery' => {
+    description: 'User loan view',
+    path: 'MyLoansQuery',
+    notes: 'Personal loan information'
+  },
+  'AllLoansQuery' => {
+    description: 'All loans data',
+    path: 'AllLoansQuery',
+    notes: 'Complete loans information'
+  }
+}
+
+# Potential operations to explore (from common patterns)
+POTENTIAL_OPERATIONS = [
+  'accounts',
+  'creditReport',
+  'creditFactors',
+  'creditCards',
+  'disputes',
+  'alerts',
+  'recommendations',
+  'savings',
+  'taxes',
+  'insurance',
+  'offers',
+  'notifications',
+  'identity',
+  'spending',
+  'budgets',
+  'goals',
+  'linkedAccounts'
+]
+
+def get_token
+  token = ENV['MY_ACCESS_TOKEN']
+  unless token
+    puts "Error: MY_ACCESS_TOKEN environment variable not set"
+    puts "Get your token from Credit Karma's network inspector (Authorization header)"
+    exit 1
+  end
+  token
+end
+
+def make_request(query, variables = {})
+  token = get_token
+  uri = URI(API_URL)
+
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = true
+  http.read_timeout = 30
+
+  request = Net::HTTP::Post.new(uri.path)
+  request['Content-Type'] = 'application/json'
+  request['Authorization'] = "Bearer #{token}"
+  request['Accept'] = 'application/json'
+  request['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+
+  body = { query: query }
+  body[:variables] = variables unless variables.empty?
+  request.body = body.to_json
+
+  response = http.request(request)
+
+  {
+    status: response.code.to_i,
+    body: response.body,
+    json: (JSON.parse(response.body) rescue nil)
+  }
+end
+
+def analyze_json_files
+  puts "Analyzing captured JSON files for GraphQL patterns...\n\n"
+
+  json_files = Dir.glob('*.json').reject { |f| f.include?('creditkarma_') }
+
+  if json_files.empty?
+    puts "No JSON files found to analyze."
+    return
+  end
+
+  all_types = {}
+  all_paths = {}
+
+  json_files.each do |file|
+    puts "=== #{file} ==="
+    begin
+      data = JSON.parse(File.read(file))
+
+      # Extract top-level keys under 'data'
+      if data['data']
+        puts "  Top-level operations: #{data['data'].keys.join(', ')}"
+        data['data'].keys.each { |k| all_paths[k] = file }
+      end
+
+      # Find all __typename values
+      types = extract_typenames(data)
+      types.each { |t| all_types[t] ||= []; all_types[t] << file }
+
+      # Find Query types
+      query_types = types.select { |t| t.end_with?('Query') }
+      puts "  Query types: #{query_types.join(', ')}" unless query_types.empty?
+
+      puts ""
+    rescue => e
+      puts "  Error: #{e.message}\n\n"
+    end
+  end
+
+  puts "\n=== Summary ==="
+  puts "\nUnique top-level paths found:"
+  all_paths.each { |path, file| puts "  - #{path} (#{file})" }
+
+  puts "\nUnique GraphQL types (#{all_types.size} total):"
+  # Show interesting types
+  interesting = all_types.keys.select { |t|
+    t.include?('Query') || t.include?('Prime_') || t.start_with?('KPL')
+  }.sort
+  interesting.first(30).each { |t| puts "  - #{t}" }
+  puts "  ... and #{interesting.size - 30} more" if interesting.size > 30
+end
+
+def extract_typenames(obj, types = Set.new)
+  case obj
+  when Hash
+    if obj['__typename']
+      types << obj['__typename']
+    end
+    obj.values.each { |v| extract_typenames(v, types) }
+  when Array
+    obj.each { |v| extract_typenames(v, types) }
+  end
+  types
+end
+
+def try_introspection
+  puts "Attempting GraphQL introspection...\n\n"
+
+  # Full introspection query
+  introspection_query = <<-GRAPHQL
+    query IntrospectionQuery {
+      __schema {
+        queryType { name }
+        mutationType { name }
+        types {
+          name
+          kind
+          fields {
+            name
+            type { name kind }
+          }
+        }
+      }
+    }
+  GRAPHQL
+
+  puts "Sending introspection query..."
+  result = make_request(introspection_query)
+
+  if result[:status] == 200 && result[:json]
+    if result[:json]['errors']
+      puts "Introspection blocked: #{result[:json]['errors'].map { |e| e['message'] }.join(', ')}"
+    elsif result[:json]['data'] && result[:json]['data']['__schema']
+      puts "Introspection SUCCESS!"
+      schema = result[:json]['data']['__schema']
+
+      # Save full schema
+      File.write('creditkarma_schema.json', JSON.pretty_generate(schema))
+      puts "Schema saved to creditkarma_schema.json"
+
+      # Print summary
+      types = schema['types'] || []
+      query_types = types.select { |t| t['name']&.start_with?('Prime_') || t['name']&.include?('Query') }
+      puts "\nQuery-related types found: #{query_types.size}"
+      query_types.first(20).each { |t| puts "  - #{t['name']}" }
+    else
+      puts "Unexpected response structure"
+      puts result[:json].inspect
+    end
+  elsif result[:status] == 401
+    puts "Authentication required (401). Make sure MY_ACCESS_TOKEN is set."
+  else
+    puts "Request failed with status #{result[:status]}"
+    puts result[:body]&.slice(0, 500)
+  end
+
+  # Try simpler queries
+  puts "\n\nTrying simpler __type queries..."
+
+  ['Prime_Query', 'Query', 'prime'].each do |type_name|
+    type_query = <<-GRAPHQL
+      query {
+        __type(name: "#{type_name}") {
+          name
+          fields { name }
+        }
+      }
+    GRAPHQL
+
+    result = make_request(type_query)
+    if result[:status] == 200 && result[:json]
+      if result[:json]['data'] && result[:json]['data']['__type']
+        puts "\nFound type: #{type_name}"
+        fields = result[:json]['data']['__type']['fields'] || []
+        puts "  Fields: #{fields.map { |f| f['name'] }.join(', ')}"
+      end
+    end
+  end
+end
+
+def probe_operations
+  puts "Probing for available operations...\n\n"
+
+  # Try to access various endpoints
+  POTENTIAL_OPERATIONS.each do |op|
+    query = "query { prime { #{op} { __typename } } }"
+
+    print "Trying prime.#{op}... "
+    result = make_request(query)
+
+    if result[:status] == 200 && result[:json]
+      if result[:json]['errors']
+        error_msg = result[:json]['errors'].first['message'] rescue 'unknown error'
+        if error_msg.include?('Cannot query field')
+          puts "NOT AVAILABLE"
+        else
+          puts "ERROR: #{error_msg.slice(0, 50)}"
+        end
+      elsif result[:json]['data']
+        puts "AVAILABLE!"
+      end
+    else
+      puts "REQUEST FAILED (#{result[:status]})"
+    end
+
+    sleep 0.5 # Rate limit
+  end
+end
+
+def list_known
+  puts "Known Credit Karma GraphQL Operations\n"
+  puts "=" * 50
+
+  KNOWN_OPERATIONS.each do |name, info|
+    puts "\n#{name}"
+    puts "  Description: #{info[:description]}"
+    puts "  Path: #{info[:path]}"
+    puts "  Input: #{info[:input]}" if info[:input]
+    puts "  Notes: #{info[:notes]}" if info[:notes]
+  end
+
+  puts "\n\nPotential operations to explore:"
+  POTENTIAL_OPERATIONS.each { |op| puts "  - #{op}" }
+end
+
+def custom_query(query_string)
+  puts "Executing custom query...\n\n"
+  result = make_request(query_string)
+
+  puts "Status: #{result[:status]}"
+  if result[:json]
+    puts "\nResponse:"
+    puts JSON.pretty_generate(result[:json])
+  else
+    puts "\nRaw response:"
+    puts result[:body]
+  end
+end
+
+# Main execution
+case ARGV[0]
+when '--analyze', '-a'
+  analyze_json_files
+when '--introspect', '-i'
+  try_introspection
+when '--probe', '-p'
+  probe_operations
+when '--list', '-l'
+  list_known
+when '--query', '-q'
+  if ARGV[1]
+    custom_query(ARGV[1])
+  else
+    puts "Usage: ruby explore_graphql --query \"query { ... }\""
+  end
+when '--help', '-h', nil
+  puts <<-HELP
+Credit Karma GraphQL Explorer
+
+Usage:
+  ruby explore_graphql [option]
+
+Options:
+  --analyze, -a     Analyze captured JSON files for GraphQL patterns
+  --introspect, -i  Attempt GraphQL introspection (requires MY_ACCESS_TOKEN)
+  --probe, -p       Probe for available operations (requires MY_ACCESS_TOKEN)
+  --list, -l        List known operations
+  --query, -q       Execute a custom GraphQL query
+  --help, -h        Show this help
+
+Environment:
+  MY_ACCESS_TOKEN   Bearer token from Credit Karma (required for API calls)
+
+Examples:
+  # Analyze your captured JSON files
+  ruby explore_graphql --analyze
+
+  # Try to get the schema
+  export MY_ACCESS_TOKEN="your_token_here"
+  ruby explore_graphql --introspect
+
+  # Probe for operations
+  ruby explore_graphql --probe
+
+  # Custom query
+  ruby explore_graphql --query "query { prime { accounts { __typename } } }"
+  HELP
+else
+  puts "Unknown option: #{ARGV[0]}"
+  puts "Use --help for usage information"
+end
