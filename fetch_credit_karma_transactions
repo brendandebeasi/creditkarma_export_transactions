@@ -20,6 +20,8 @@ REQUEST_DELAY_SECONDS = Float(ENV['REQUEST_DELAY'] || 1.5)
 MAX_RETRIES = Integer(ENV['MAX_RETRIES'] || 5)
 INITIAL_BACKOFF_SECONDS = 5
 
+class TokenExpiredError < StandardError; end
+
 def debug(msg)
   ap msg if ENV['DEBUG']
 end
@@ -36,6 +38,30 @@ end
 
 def clear_cursor_file
   File.delete(CURSOR_FILE) if File.exist?(CURSOR_FILE)
+end
+
+def beep(times = 3)
+  times.times { print "\a"; sleep 0.3 }
+end
+
+def prompt_for_new_token
+  beep
+  puts "\n" + "=" * 60
+  puts "TOKEN EXPIRED - Need a new access token to continue"
+  puts "=" * 60
+  puts "\nGet a new token from Credit Karma (see README for instructions)"
+  puts "Paste the new token below and press Enter:"
+  puts "(or type 'quit' to exit and resume later)\n\n"
+
+  print "> "
+  input = $stdin.gets&.strip
+
+  if input.nil? || input.downcase == 'quit' || input.empty?
+    puts "\nExiting. Cursor saved - run again to resume."
+    exit 0
+  end
+
+  input
 end
 
 RETRIABLE_ERRORS = [
@@ -3970,15 +3996,7 @@ def get_transactions(after_cursor = nil)
   response = https.post(uri.path, params.to_json, headers)
   if response.code != '200'
     if response.code == '401'
-      puts @help_message
-      puts
-      # obfuscate the token a bit for error reporting
-      obfuscated = ENV['MY_ACCESS_TOKEN']
-      if obfuscated.to_s.size > 10
-        obfuscated = "#{ENV['MY_ACCESS_TOKEN'].to_s[0..5]}...#{ENV['MY_ACCESS_TOKEN'].to_s[-5..-1]}"
-      end
-      puts "401, either MY_ACCESS_TOKEN (#{obfuscated}) was invalid or needs refresh"
-      puts "MY_ACCESS_TOKEN: should look like eyJra...kA2Uh  It'll be pretty long, the ... is just to shorten it for this message"
+      raise TokenExpiredError, "Token expired or invalid (401): #{response.body}"
     end
 
     raise "error: #{response.code} body: #{response.body}"
@@ -4013,7 +4031,15 @@ while has_next_page
   # Save current cursor before attempting fetch (so we can resume if it fails)
   save_cursor(cursor) if cursor
 
-  resp = with_retry(cursor) { get_transactions(cursor) }
+  begin
+    resp = with_retry(cursor) { get_transactions(cursor) }
+  rescue TokenExpiredError => e
+    puts "\n#{e.message}"
+    save_cursor(cursor)
+    @access_token = prompt_for_new_token
+    puts "\nToken updated. Resuming...\n"
+    retry
+  end
 
   # Rate limit: wait between requests
   sleep(REQUEST_DELAY_SECONDS) if REQUEST_DELAY_SECONDS > 0
