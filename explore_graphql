@@ -27,51 +27,86 @@ require 'set'
 
 API_URL = 'https://api.creditkarma.com/graphql'
 
-# Known GraphQL operations discovered from analysis
+# Known GraphQL operations discovered from analysis (verified working Jan 2026)
 KNOWN_OPERATIONS = {
   # Transaction operations
-  'GetTransactions' => {
+  'prime.transactionsHub' => {
     description: 'Fetch transaction history with pagination',
-    path: 'prime.transactionsHub',
-    input: 'Prime_TransactionFiltersInput'
+    typename: 'Prime_Transactions',
+    input: 'Prime_TransactionFiltersInput',
+    notes: 'Main transaction export endpoint'
   },
 
   # Net worth / balance operations
-  'networth' => {
+  'prime.networth' => {
     description: 'Overall net worth summary and history chart',
-    path: 'prime.networth',
+    typename: 'Prime_NetworthLayout',
     notes: 'Contains dataVisualizationGroupDataSets with balance history'
   },
-  'networthByAccountType' => {
+  'prime.networthByAccountType' => {
     description: 'Balance history for specific account categories (Cash, Investments, etc)',
-    path: 'prime.networthByAccountType',
+    typename: 'Prime_NetworthLayout',
     notes: 'Accessed via L2 pages when clicking on account categories'
   },
 
   # Dashboard operations
   'dashboardV2' => {
-    description: 'Main dashboard with credit scores',
-    path: 'dashboardV2.equifaxCredit, dashboardV2.transunionCredit',
-    notes: 'Contains credit scores for both bureaus'
+    description: 'Main dashboard with credit scores and account summaries',
+    typename: 'DashboardV2',
+    notes: 'Contains credit scores for both Equifax and TransUnion'
   },
 
   # Profile operations
   'profileOverview' => {
     description: 'User profile information',
-    path: 'profileOverview.getProfileOverview',
-    notes: 'Name, address, etc.'
+    typename: 'ProfileOverview',
+    notes: 'Name, address, contact info'
   },
 
   # Loans operations
-  'MyLoansQuery' => {
+  'myLoans' => {
     description: 'User loan view',
-    path: 'MyLoansQuery',
+    typename: 'MyLoansQuery',
     notes: 'Personal loan information'
   },
-  'AllLoansQuery' => {
+  'allLoans' => {
     description: 'All loans data',
-    path: 'AllLoansQuery',
+    typename: 'AllLoansQuery',
     notes: 'Complete loans information'
+  },
+
+  # Financial products
+  'mortgage' => {
+    description: 'Mortgage information',
+    typename: 'MortgageQuery',
+    notes: 'Home loan details'
+  },
+  'savings' => {
+    description: 'Savings accounts',
+    typename: 'Savings',
+    notes: 'Savings products and accounts'
+  },
+  'insurance' => {
+    description: 'Insurance information',
+    typename: 'Insurance_Query',
+    notes: 'Insurance products and policies'
+  },
+  'auto' => {
+    description: 'Auto loans and information',
+    typename: 'AutoQuery',
+    notes: 'Vehicle financing details'
+  },
+  'home' => {
+    description: 'Home/property information',
+    typename: 'HomeQuery',
+    notes: 'Property and home equity data'
+  },
+
+  # Recommendations
+  'recsysFeed' => {
+    description: 'Personalized recommendations feed',
+    typename: 'RecsysFeed',
+    notes: 'Product and action recommendations'
   }
 }
 
@@ -117,8 +152,12 @@ def make_request(query, variables = {})
   request = Net::HTTP::Post.new(uri.path)
   request['Content-Type'] = 'application/json'
   request['Authorization'] = "Bearer #{token}"
-  request['Accept'] = 'application/json'
-  request['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+  request['Accept'] = '*/*'
+  request['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36'
+  request['Origin'] = 'https://www.creditkarma.com'
+  request['Referer'] = 'https://www.creditkarma.com/'
+  request['ck-client-name'] = 'navigation-web'
+  request['ck-client-version'] = '3.25.1'
 
   body = { query: query }
   body[:variables] = variables unless variables.empty?
@@ -302,16 +341,21 @@ def probe_operations
 end
 
 def list_known
-  puts "Known Credit Karma GraphQL Operations\n"
-  puts "=" * 50
+  puts "Known Credit Karma GraphQL Operations (verified Jan 2026)\n"
+  puts "=" * 60
 
   KNOWN_OPERATIONS.each do |name, info|
     puts "\n#{name}"
     puts "  Description: #{info[:description]}"
-    puts "  Path: #{info[:path]}"
+    puts "  Type: #{info[:typename]}" if info[:typename]
     puts "  Input: #{info[:input]}" if info[:input]
     puts "  Notes: #{info[:notes]}" if info[:notes]
   end
+
+  puts "\n\nOperations that did NOT work (may need different structure):"
+  puts "  creditScore, creditFactors, creditReport, alerts, identity,"
+  puts "  spending, linkedAccounts, settings, notifications, member,"
+  puts "  tax, cards, fraud"
 
   puts "\n\nPotential operations to explore:"
   POTENTIAL_OPERATIONS.each { |op| puts "  - #{op}" }
