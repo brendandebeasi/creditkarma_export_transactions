@@ -1,0 +1,232 @@
+#!/usr/bin/env ruby
+
+# This script parses Credit Karma GraphQL JSON responses to extract balance history data.
+# It can parse JSON files captured from the browser's network inspector.
+#
+# Usage:
+#   ruby parse_balance_history [json_file...]
+#
+# If no files are provided, it will look for common filenames in the current directory.
+#
+# Output:
+#   - creditkarma_balance_history.csv - All balance history data points
+
+require 'json'
+require 'date'
+
+# Parse date string like "Jan 31, 2012" or "Dec 21, 2025"
+def parse_date(date_str)
+  Date.strptime(date_str, '%b %d, %Y')
+rescue ArgumentError
+  begin
+    Date.parse(date_str)
+  rescue
+    nil
+  end
+end
+
+# Extract data points from a dataset's lines
+def extract_points_from_dataset(dataset)
+  points = []
+  dataset_key = dataset['dataSetKey']
+
+  data_set = dataset['dataVisualizationDataSet']
+  return points unless data_set
+
+  lines = data_set['lines'] || []
+
+  lines.each do |line|
+    line_points = line['points'] || []
+    line_points.each do |point|
+      date_str = point.dig('xValueLabel', 'spans', 0, 'text')
+      value = point['yValue']
+
+      next unless date_str && value
+
+      date = parse_date(date_str)
+      next unless date
+
+      points << {
+        date: date,
+        date_str: date_str,
+        value: value,
+        dataset_key: dataset_key
+      }
+    end
+  end
+
+  points
+end
+
+# Extract balance history from networth page
+def extract_from_networth(data)
+  results = []
+
+  cards = data.dig('data', 'prime', 'networth', 'cards') || []
+
+  cards.each do |card|
+    item = card['item']
+    next unless item
+
+    views = item['views'] || []
+    views.each do |view|
+      datasets = view['dataVisualizationGroupDataSets'] || []
+
+      datasets.each do |dataset|
+        points = extract_points_from_dataset(dataset)
+
+        points.each do |point|
+          results << {
+            account_type: 'Net Worth',
+            account_name: 'Total',
+            period: point[:dataset_key],
+            date: point[:date],
+            date_str: point[:date_str],
+            value: point[:value]
+          }
+        end
+      end
+    end
+  end
+
+  results
+end
+
+# Extract balance history from account type page (Cash, Investments, etc.)
+def extract_from_account_type(data)
+  results = []
+
+  # Get account type name from header
+  account_type = data.dig('data', 'prime', 'networthByAccountType', 'cards', 0, 'item', 'header', 'heroNumberHeaderTitle', 'spans', 0, 'text') || 'Unknown'
+
+  cards = data.dig('data', 'prime', 'networthByAccountType', 'cards') || []
+
+  cards.each do |card|
+    item = card['item']
+    next unless item
+
+    views = item['views'] || []
+    views.each do |view|
+      datasets = view['dataVisualizationGroupDataSets'] || []
+
+      datasets.each do |dataset|
+        points = extract_points_from_dataset(dataset)
+
+        points.each do |point|
+          results << {
+            account_type: account_type,
+            account_name: 'Total',
+            period: point[:dataset_key],
+            date: point[:date],
+            date_str: point[:date_str],
+            value: point[:value]
+          }
+        end
+      end
+    end
+  end
+
+  results
+end
+
+# Main extraction logic
+def extract_balance_history(data, source_name)
+  results = []
+
+  if data.dig('data', 'prime', 'networth')
+    results += extract_from_networth(data)
+  end
+
+  if data.dig('data', 'prime', 'networthByAccountType')
+    results += extract_from_account_type(data)
+  end
+
+  results
+end
+
+# Main execution
+def main
+  files = ARGV.dup
+
+  # If no files specified, look for common ones
+  if files.empty?
+    common_files = Dir.glob('*.json').reject { |f| f.include?('creditkarma_') }
+
+    if common_files.empty?
+      puts "No JSON files specified and no JSON files found."
+      puts "Usage: ruby parse_balance_history [json_file...]"
+      exit 1
+    end
+
+    puts "Found JSON files: #{common_files.join(', ')}"
+    files = common_files
+  end
+
+  all_results = []
+
+  files.each do |file|
+    puts "Parsing #{file}..."
+    begin
+      data = JSON.parse(File.read(file))
+      results = extract_balance_history(data, File.basename(file))
+      puts "  Found #{results.size} data points"
+      all_results += results
+    rescue JSON::ParserError => e
+      puts "  Error parsing JSON: #{e.message}"
+    rescue => e
+      puts "  Error: #{e.message}"
+      puts "  #{e.backtrace.first(3).join("\n  ")}"
+    end
+  end
+
+  if all_results.empty?
+    puts "\nNo balance history data found in the provided files."
+    puts "Make sure the JSON files contain Credit Karma networth GraphQL responses."
+    exit 1
+  end
+
+  # Filter to only "All" period for complete history
+  all_period_data = all_results.select { |r| r[:period] == 'All' }
+
+  if all_period_data.empty?
+    puts "\nNo 'All' period data found. Using longest available period."
+    # Find the period with most data points
+    by_period = all_results.group_by { |r| r[:period] }
+    longest_period = by_period.max_by { |k, v| v.size }
+    all_period_data = longest_period[1]
+    puts "Using period: #{longest_period[0]} (#{all_period_data.size} points)"
+  end
+
+  # Deduplicate by account_type + date
+  unique_data = all_period_data.uniq { |r| [r[:account_type], r[:date]] }
+  unique_data.sort_by! { |r| [r[:account_type], r[:date]] }
+
+  # Write CSV
+  csv_file = 'creditkarma_balance_history.csv'
+  File.open(csv_file, 'w') do |f|
+    f.puts '"Date","Account Type","Account Name","Balance"'
+    unique_data.each do |row|
+      f.puts %Q{"#{row[:date]}","#{row[:account_type]}","#{row[:account_name]}","#{row[:value]}"}
+    end
+  end
+
+  puts "\nWrote #{unique_data.size} records to #{csv_file}"
+
+  # Summary by account type
+  puts "\nSummary by account type:"
+  unique_data.group_by { |r| r[:account_type] }.each do |account_type, rows|
+    dates = rows.map { |r| r[:date] }
+    puts "  #{account_type}: #{rows.size} data points (#{dates.min} to #{dates.max})"
+  end
+
+  # Also write JSON
+  json_file = 'creditkarma_balance_history.json'
+  File.open(json_file, 'w') do |f|
+    f.puts JSON.pretty_generate(unique_data.map { |r|
+      { date: r[:date].to_s, account_type: r[:account_type], balance: r[:value] }
+    })
+  end
+  puts "Wrote full data to #{json_file}"
+end
+
+main
